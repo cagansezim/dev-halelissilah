@@ -1,0 +1,6 @@
+_dataset/
+.dockerignore
+Makefile
+Makefile.bak
+*/*/*/__pycache__
+*/*/__pycache__

@@ -1,0 +1,74 @@
+# ---- extractor base --------------------------------------------------------
+FROM python:3.11-slim-bookworm
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG INSTALL_PADDLE=0
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
+
+# network-flake resistant apt + IPv4 + https mirrors
+RUN set -eux; \
+    echo 'Acquire::Retries "5"; Acquire::http::Timeout "40"; Acquire::https::Timeout "40"; Acquire::ForceIPv4 "true";' >/etc/apt/apt.conf.d/99retries; \
+    if [ -f /etc/apt/sources.list ]; then \
+      sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list; \
+      sed -i 's|http://security.debian.org|https://security.debian.org|g' /etc/apt/sources.list; \
+    fi; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i -e 's|http://deb.debian.org/debian|https://deb.debian.org/debian|g' \
+             -e 's|http://security.debian.org/debian-security|https://security.debian.org/debian-security|g' \
+             /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    for i in 1 2 3 4 5; do \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        build-essential swig \
+        poppler-utils ghostscript \
+        tesseract-ocr tesseract-ocr-eng tesseract-ocr-tur \
+        libglib2.0-0 libgl1 libmagic1 \
+        ca-certificates curl && \
+      rm -rf /var/lib/apt/lists/* && break || { echo "APT attempt $i failed"; sleep 5; }; \
+    done
+
+WORKDIR /app
+
+# deps (keep stable to maximize cache hits)
+COPY requirements.txt .
+RUN python -m pip install --upgrade pip wheel \
+ && pip --default-timeout=180 install --no-cache-dir -r requirements.txt \
+ && if [ "$INSTALL_PADDLE" = "1" ]; then \
+        pip --default-timeout=600 install --no-cache-dir \
+          paddlepaddle==2.6.1 paddleocr==3.3.0; \
+    fi \
+ && pip --default-timeout=180 install --no-cache-dir --only-binary=:all: PyMuPDF
+
+# source (bind-mounted in dev profile to avoid rebuilds)
+COPY apps ./apps
+COPY packages ./packages
+
+# Pydantic v2 patcher (idempotent)
+COPY scripts/patch_pydantic_fields.py /usr/local/bin/patch_pydantic_fields.py
+RUN python /usr/local/bin/patch_pydantic_fields.py /app || true
+
+# fail-fast imports — Paddle is optional
+RUN python - <<'PY'
+import importlib, sys
+mods = ["pytesseract","pdf2image","PyPDF2","extract_msg"]
+for m in mods:
+    importlib.import_module(m); print("OK:", m)
+try:
+    importlib.import_module("paddleocr")
+    print("OK: paddleocr")
+except Exception as e:
+    print("paddleocr optional:", e)
+print("Sanity imports OK")
+PY
+
+# optional OCR smoke test (won't fail build)
+COPY scripts/ocr_selfcheck.py /usr/local/bin/ocr_selfcheck.py
+RUN python /usr/local/bin/ocr_selfcheck.py || true
+
+EXPOSE 8081
+# compose supplies the exact command
